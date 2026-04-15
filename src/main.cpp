@@ -5,10 +5,13 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <driver/i2s.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <atomic>
 #include "config.h"
 
 static const int16_t ADPCM_STEP_TABLE[89] = {
@@ -80,33 +83,40 @@ struct __attribute__((packed)) Packet {
 static_assert(sizeof(Packet) == NRF_PAYLOAD_SIZE, "Packet size mismatch");
 
 struct TxPacket { uint8_t raw[NRF_PAYLOAD_SIZE]; };
-struct RxFrame   { int16_t pcm[ADPCM_SAMPLES_PER_PKT * 2]; uint16_t count; };
+struct RxFrame {
+    int16_t  pcm[ADPCM_SAMPLES_PER_PKT * 2];
+    uint16_t count;
+    bool     gap;
+};
 
-static QueueHandle_t txQueue;
-static QueueHandle_t rxQueue;
+static QueueHandle_t    txQueue;
+static QueueHandle_t    rxQueue;
 static SemaphoreHandle_t radioMutex;
 
-static RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
-static Adafruit_SH1106G display(128, 64, &Wire, -1);
+static RF24               radio(NRF_CE_PIN, NRF_CSN_PIN);
+static Adafruit_SH1106G   display(128, 64, &Wire, -1);
+static esp_adc_cal_characteristics_t adcChars;
 
-static volatile uint8_t  gChannelIdx   = DEFAULT_CHANNEL_IDX;
-static volatile uint8_t  gVolume       = VOLUME_DEFAULT;
-static volatile uint16_t gSquelch      = SQUELCH_DEFAULT;
-static volatile bool     gTransmitting = false;
+static std::atomic<bool>    gTransmitting{false};
+static std::atomic<uint8_t> gChannelIdx{DEFAULT_CHANNEL_IDX};
+static std::atomic<uint8_t> gVolume{VOLUME_DEFAULT};
+static std::atomic<uint16_t> gSquelch{SQUELCH_DEFAULT};
 static volatile bool     gDisplayDirty = true;
 
 static float    gBatVoltage  = 0.0f;
 static uint8_t  gBatPct      = 0;
 static uint8_t  gSignalBars  = 0;
 static uint32_t gPktsReceived = 0;
+static uint32_t gPktsLost     = 0;
 static uint32_t gSignalWindowStart = 0;
 static uint32_t gPktsInWindow = 0;
+static uint32_t gLostInWindow = 0;
 
-static uint8_t  gTxSeq = 0;
+static uint8_t  gTxSeq    = 0;
 static uint8_t  gRxLastSeq = 0xFF;
 
 enum MenuState { MENU_NONE, MENU_MAIN, MENU_VOLUME, MENU_SQUELCH, MENU_CHANNEL };
-static volatile MenuState gMenu = MENU_NONE;
+static volatile MenuState gMenu    = MENU_NONE;
 static volatile uint8_t   gMenuSel = 0;
 
 static void i2s_speaker_init() {
@@ -118,7 +128,7 @@ static void i2s_speaker_init() {
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count        = 4;
-    cfg.dma_buf_len          = 256;
+    cfg.dma_buf_len          = 128;
     cfg.use_apll             = false;
     cfg.tx_desc_auto_clear   = true;
 
@@ -141,7 +151,7 @@ static void i2s_mic_init() {
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count        = 4;
-    cfg.dma_buf_len          = 256;
+    cfg.dma_buf_len          = 128;
     cfg.use_apll             = false;
 
     i2s_pin_config_t pins = {};
@@ -158,7 +168,8 @@ static float read_battery_voltage() {
     uint32_t raw = 0;
     for (int i = 0; i < 16; i++) raw += analogRead(BAT_ADC_PIN);
     raw >>= 4;
-    float vadc = (raw / BAT_ADC_MAX) * BAT_VREF;
+    uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &adcChars);
+    float vadc = mv / 1000.0f;
     return vadc * (BAT_R1 + BAT_R2) / BAT_R2;
 }
 
@@ -182,17 +193,40 @@ static uint16_t compute_rms(const int16_t *buf, uint16_t len) {
     return (uint16_t)sqrtf((float)(sum / len));
 }
 
+static void remove_dc_offset(int16_t *buf, uint16_t len) {
+    int32_t sum = 0;
+    for (uint16_t i = 0; i < len; i++) sum += buf[i];
+    int16_t dc = (int16_t)(sum / len);
+    for (uint16_t i = 0; i < len; i++) buf[i] -= dc;
+}
+
+static void apply_limiter(int16_t *buf, uint16_t len) {
+    for (uint16_t i = 0; i < len; i++) {
+        if      (buf[i] >  29000) buf[i] =  29000;
+        else if (buf[i] < -29000) buf[i] = -29000;
+    }
+}
+
+static void apply_fade_in(int16_t *buf, uint16_t len, uint8_t fadeLen) {
+    uint8_t n = (len < fadeLen) ? len : fadeLen;
+    for (uint8_t i = 0; i < n; i++) {
+        buf[i] = (int16_t)(((int32_t)buf[i] * i) / n);
+    }
+}
+
 static void update_signal_bars() {
-    uint32_t now = millis();
+    uint32_t now     = millis();
     uint32_t elapsed = now - gSignalWindowStart;
     if (elapsed >= SIGNAL_WINDOW_MS) {
-        float rate = (float)gPktsInWindow / ((float)elapsed / 1000.0f);
-        if      (rate > 15.0f) gSignalBars = 4;
-        else if (rate > 8.0f)  gSignalBars = 3;
-        else if (rate > 3.0f)  gSignalBars = 2;
-        else if (rate > 0.5f)  gSignalBars = 1;
+        uint32_t total = gPktsInWindow + gLostInWindow;
+        uint8_t quality = (total > 0) ? (uint8_t)((gPktsInWindow * 100) / total) : 0;
+        if      (quality > 90) gSignalBars = 4;
+        else if (quality > 70) gSignalBars = 3;
+        else if (quality > 40) gSignalBars = 2;
+        else if (quality > 10) gSignalBars = 1;
         else                   gSignalBars = 0;
         gPktsInWindow      = 0;
+        gLostInWindow      = 0;
         gSignalWindowStart = now;
     }
 }
@@ -206,7 +240,7 @@ static void draw_battery_icon(uint8_t x, uint8_t y, uint8_t pct) {
 
 static void draw_signal_bars(uint8_t x, uint8_t y, uint8_t bars) {
     for (uint8_t i = 0; i < 4; i++) {
-        uint8_t h = (i+1)*3;
+        uint8_t h  = (i+1)*3;
         uint8_t bx = x + i*5;
         uint8_t by = y + (12 - h);
         if (i < bars) display.fillRect(bx, by, 4, h, SH110X_WHITE);
@@ -220,9 +254,9 @@ static void draw_main_screen() {
     display.setTextColor(SH110X_WHITE);
     display.setCursor(0, 0);
     display.print("CH:");
-    display.print(gChannelIdx + 1);
+    display.print((uint8_t)gChannelIdx + 1);
     display.print(" ");
-    display.print(CHANNEL_MHZ[gChannelIdx]);
+    display.print(CHANNEL_MHZ[(uint8_t)gChannelIdx]);
     display.print("M");
     draw_signal_bars(90, 0, gSignalBars);
     display.setCursor(0, 12);
@@ -234,9 +268,9 @@ static void draw_main_screen() {
     draw_battery_icon(95, 12, gBatPct);
     display.setCursor(0, 24);
     display.print("SQ:");
-    display.print(gSquelch);
+    display.print((uint16_t)gSquelch);
     display.print("  VOL:");
-    display.print(gVolume);
+    display.print((uint8_t)gVolume);
     display.drawFastHLine(0, 35, 128, SH110X_WHITE);
     display.setTextSize(2);
     display.setCursor(0, 40);
@@ -296,10 +330,10 @@ static void draw_channel_screen() {
     display.setTextSize(2);
     display.setCursor(10, 20);
     display.print("CH ");
-    display.print(gChannelIdx + 1);
+    display.print((uint8_t)gChannelIdx + 1);
     display.setTextSize(1);
     display.setCursor(10, 44);
-    display.print(CHANNEL_MHZ[gChannelIdx]);
+    display.print(CHANNEL_MHZ[(uint8_t)gChannelIdx]);
     display.print(" MHz");
     display.display();
 }
@@ -308,7 +342,7 @@ static void update_display() {
     switch (gMenu) {
         case MENU_NONE:    draw_main_screen(); break;
         case MENU_MAIN:    draw_menu_screen(); break;
-        case MENU_VOLUME:  draw_value_screen("Volume", gVolume, VOLUME_MIN, VOLUME_MAX); break;
+        case MENU_VOLUME:  draw_value_screen("Volume",  gVolume,  VOLUME_MIN,  VOLUME_MAX);  break;
         case MENU_SQUELCH: draw_value_screen("Squelch", gSquelch, SQUELCH_MIN, SQUELCH_MAX); break;
         case MENU_CHANNEL: draw_channel_screen(); break;
     }
@@ -328,7 +362,8 @@ static void radio_init() {
     radio.setPayloadSize(NRF_PAYLOAD_SIZE);
     radio.setChannel(CHANNEL_LIST[gChannelIdx]);
     radio.setCRCLength(RF24_CRC_16);
-    radio.setAutoAck(false);
+    radio.setAutoAck(true);
+    radio.setRetries(2, 3);
     radio.openWritingPipe(NRF_PIPE_ADDR);
     radio.openReadingPipe(1, NRF_PIPE_ADDR);
     radio.startListening();
@@ -342,7 +377,7 @@ static bool btn_fell(uint8_t idx) {
     uint8_t raw = (digitalRead(BTN_PINS[idx]) == LOW) ? 1 : 0;
     uint32_t now = millis();
     if (raw != btnStates[idx].last && (now - btnStates[idx].lastMs) > DEBOUNCE_MS) {
-        btnStates[idx].last  = raw;
+        btnStates[idx].last   = raw;
         btnStates[idx].lastMs = now;
         return raw == 1;
     }
@@ -356,13 +391,13 @@ static void handle_menu_buttons() {
                 if (gMenuSel > 0) gMenuSel--;
                 break;
             case MENU_VOLUME:
-                if (gVolume < VOLUME_MAX) { gVolume++; }
+                if ((uint8_t)gVolume < VOLUME_MAX) gVolume++;
                 break;
             case MENU_SQUELCH:
-                if (gSquelch < SQUELCH_MAX) { gSquelch += SQUELCH_STEP; }
+                if ((uint16_t)gSquelch < SQUELCH_MAX) gSquelch = gSquelch + SQUELCH_STEP;
                 break;
             case MENU_CHANNEL:
-                if (gChannelIdx < CHANNEL_COUNT-1) {
+                if ((uint8_t)gChannelIdx < CHANNEL_COUNT-1) {
                     gChannelIdx++;
                     xSemaphoreTake(radioMutex, portMAX_DELAY);
                     radio_apply_channel(gChannelIdx);
@@ -379,13 +414,13 @@ static void handle_menu_buttons() {
                 if (gMenuSel < MENU_ITEM_COUNT-1) gMenuSel++;
                 break;
             case MENU_VOLUME:
-                if (gVolume > VOLUME_MIN) { gVolume--; }
+                if ((uint8_t)gVolume > VOLUME_MIN) gVolume--;
                 break;
             case MENU_SQUELCH:
-                if (gSquelch >= (uint16_t)(SQUELCH_MIN + SQUELCH_STEP)) { gSquelch -= SQUELCH_STEP; }
+                if ((uint16_t)gSquelch >= (uint16_t)(SQUELCH_MIN + SQUELCH_STEP)) gSquelch = gSquelch - SQUELCH_STEP;
                 break;
             case MENU_CHANNEL:
-                if (gChannelIdx > 0) {
+                if ((uint8_t)gChannelIdx > 0) {
                     gChannelIdx--;
                     xSemaphoreTake(radioMutex, portMAX_DELAY);
                     radio_apply_channel(gChannelIdx);
@@ -405,7 +440,7 @@ static void handle_menu_buttons() {
     }
     if (btn_fell(3)) {
         if (gMenu == MENU_NONE) {
-            gMenu = MENU_MAIN;
+            gMenu    = MENU_MAIN;
             gMenuSel = 0;
         } else if (gMenu == MENU_MAIN) {
             switch (gMenuSel) {
@@ -422,9 +457,9 @@ static void handle_menu_buttons() {
 }
 
 static void task_capture(void *) {
-    static int16_t      pcmBuf[MIC_CAPTURE_SAMPLES];
-    static AdpcmState   encState = {0, 0};
-    static uint8_t      adpcmOut[MIC_CAPTURE_SAMPLES / 2];
+    static int16_t    pcmBuf[MIC_CAPTURE_SAMPLES];
+    static AdpcmState encState = {0, 0};
+    static uint8_t    adpcmOut[MIC_CAPTURE_SAMPLES / 2];
 
     while (true) {
         if (!gTransmitting) {
@@ -432,9 +467,12 @@ static void task_capture(void *) {
             continue;
         }
         size_t got = 0;
-        i2s_read(I2S_NUM_1, pcmBuf, MIC_CAPTURE_SAMPLES * sizeof(int16_t), &got, pdMS_TO_TICKS(50));
+        i2s_read(I2S_NUM_1, pcmBuf, MIC_CAPTURE_SAMPLES * sizeof(int16_t), &got, pdMS_TO_TICKS(10));
         uint16_t samples = got / sizeof(int16_t);
         if (samples == 0) continue;
+
+        remove_dc_offset(pcmBuf, samples);
+        apply_limiter(pcmBuf, samples);
 
         uint16_t offset = 0;
         while (offset < samples) {
@@ -455,7 +493,12 @@ static void task_capture(void *) {
 
             TxPacket tp;
             memcpy(tp.raw, &pkt, NRF_PAYLOAD_SIZE);
-            xQueueSend(txQueue, &tp, 0);
+
+            if (xQueueSend(txQueue, &tp, 0) != pdTRUE) {
+                uint8_t dummy[sizeof(TxPacket)];
+                xQueueReceive(txQueue, dummy, 0);
+                xQueueSend(txQueue, &tp, 0);
+            }
             offset += count;
         }
     }
@@ -468,7 +511,7 @@ static void task_transmit(void *) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-        if (xQueueReceive(txQueue, &tp, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (xQueueReceive(txQueue, &tp, pdMS_TO_TICKS(10)) == pdTRUE) {
             xSemaphoreTake(radioMutex, portMAX_DELAY);
             radio.write(tp.raw, NRF_PAYLOAD_SIZE);
             xSemaphoreGive(radioMutex);
@@ -492,12 +535,18 @@ static void task_receive(void *) {
             if (pkt.type == PKT_AUDIO && pkt.dataLen > 0 &&
                 pkt.dataLen <= (NRF_PAYLOAD_SIZE - 6)) {
 
-                uint8_t expectedSeq = (uint8_t)(gRxLastSeq + 1);
-                if (gRxLastSeq != 0xFF && pkt.seq != expectedSeq) {
-                    RxFrame silence;
-                    silence.count = ADPCM_SAMPLES_PER_PKT;
-                    memset(silence.pcm, 0, sizeof(silence.pcm));
-                    xQueueSend(rxQueue, &silence, 0);
+                if (gRxLastSeq != 0xFF) {
+                    uint8_t expected = (uint8_t)(gRxLastSeq + 1);
+                    uint8_t lost     = (uint8_t)(pkt.seq - expected);
+                    if (lost > 0 && lost < 10) {
+                        gPktsLost    += lost;
+                        gLostInWindow += lost;
+                        RxFrame silence;
+                        silence.count = ADPCM_SAMPLES_PER_PKT;
+                        silence.gap   = false;
+                        memset(silence.pcm, 0, sizeof(silence.pcm));
+                        xQueueSend(rxQueue, &silence, 0);
+                    }
                 }
                 gRxLastSeq = pkt.seq;
                 gPktsInWindow++;
@@ -506,11 +555,16 @@ static void task_receive(void *) {
                 AdpcmState ds = {pkt.adpcmPred, pkt.adpcmIdx};
                 RxFrame frame;
                 frame.count = pkt.dataLen * 2;
+                frame.gap   = (gRxLastSeq != (uint8_t)(pkt.seq));
                 adpcm_decode(pkt.data, frame.pcm, pkt.dataLen, ds);
 
                 uint16_t rms = compute_rms(frame.pcm, frame.count);
-                if (rms >= gSquelch) {
-                    xQueueSend(rxQueue, &frame, 0);
+                if (rms >= (uint16_t)gSquelch) {
+                    if (xQueueSend(rxQueue, &frame, 0) != pdTRUE) {
+                        RxFrame dummy;
+                        xQueueReceive(rxQueue, &dummy, 0);
+                        xQueueSend(rxQueue, &frame, 0);
+                    }
                 }
             }
         } else {
@@ -527,7 +581,10 @@ static void task_playback(void *) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-        if (xQueueReceive(rxQueue, &frame, pdMS_TO_TICKS(30)) == pdTRUE) {
+        if (xQueueReceive(rxQueue, &frame, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (frame.gap) {
+                apply_fade_in(frame.pcm, frame.count, 8);
+            }
             uint8_t vol = gVolume;
             for (uint16_t i = 0; i < frame.count; i++) {
                 frame.pcm[i] = (int16_t)constrain(
@@ -535,7 +592,7 @@ static void task_playback(void *) {
                     -32768, 32767);
             }
             size_t written = 0;
-            i2s_write(I2S_NUM_0, frame.pcm, frame.count * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
+            i2s_write(I2S_NUM_0, frame.pcm, frame.count * sizeof(int16_t), &written, pdMS_TO_TICKS(20));
         }
     }
 }
@@ -548,7 +605,7 @@ static void task_ui(void *) {
         uint32_t now = millis();
         bool ptt = (digitalRead(BTN_PTT_PIN) == LOW);
 
-        if (ptt != gTransmitting) {
+        if (ptt != (bool)gTransmitting) {
             gTransmitting = ptt;
             xSemaphoreTake(radioMutex, portMAX_DELAY);
             if (ptt) {
@@ -563,6 +620,7 @@ static void task_ui(void *) {
                 endPkt.adpcmIdx  = 0;
                 endPkt.dataLen   = 0;
                 radio.write(&endPkt, NRF_PAYLOAD_SIZE);
+                radio.txStandBy();
                 radio.startListening();
                 xQueueReset(rxQueue);
             }
@@ -591,6 +649,7 @@ static void task_ui(void *) {
 }
 
 void setup() {
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adcChars);
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
 
