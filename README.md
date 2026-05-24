@@ -39,7 +39,7 @@ A DIY walkie-talkie built on the ESP32 microcontroller featuring real-time voice
 | MOSI | GPIO 23 | SPI Data In |
 | MISO | GPIO 19 | SPI Data Out |
 
-> **Note**: For better range, use an NRF24L01+PA/LNA module with external antenna.
+> **Note**: For better range, use an NRF24L01+PA/LNA module with external antenna. or even better, an E01C-2G4M27D for just 1.5$-2$ more.
 
 ### SH1106 OLED Display (I2C)
 
