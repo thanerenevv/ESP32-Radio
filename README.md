@@ -1,16 +1,20 @@
 # ESP32 DIY Walkie-Talkie
 
-A DIY walkie-talkie built on the ESP32 microcontroller featuring real-time voice communication using NRF24L01 radio modules, ADPCM audio compression, and an OLED display interface.
+A DIY walkie-talkie built on the ESP32 microcontroller featuring real-time, half-duplex (push-to-talk) voice communication using NRF24L01 radio modules, ADPCM audio compression, optional ChaCha20 link encryption, and an OLED display interface.
 
 ## Features
 
-- **Real-time Voice Communication**: Full-duplex capable voice transmission using ADPCM compression for efficient bandwidth usage
-- **11 Channels**: Frequencies from 2400 MHz to 2500 MHz
-- **OLED Display**: 128x64 SH1106 display showing channel, battery, signal strength, and settings
-- **Menu System**: Adjust volume, squelch, and channel selection
-- **Battery Monitoring**: Real-time LiPo battery voltage and percentage display
-- **Signal Quality Indicator**: 4-bar signal strength based on packet loss
-- **FreeRTOS Multitasking**: Dedicated tasks for capture, transmission, reception, playback, and UI
+- **Real-time Voice**: Half-duplex push-to-talk voice with ADPCM compression (4:1) and a packet-loss-concealing jitter buffer
+- **Encrypted Link** *(optional)*: ChaCha20 keystream encryption of the audio payload so casual listeners on the same channel can't eavesdrop (see [Security](#security))
+- **11 Channels** with editable names: 2400–2500 MHz
+- **Channel Scan**: hop the channel list and stop on the first active conversation
+- **VOX** *(optional)*: hands-free voice-activated transmit (best with a headset)
+- **TX Timeout**: automatically drops back to RX after 120 s of continuous transmit (anti-stuck-PTT / channel hog)
+- **Persistent Settings**: volume, squelch, channel and VOX are saved to NVS and restored on boot
+- **OLED Display**: 128x64 SH1106 with channel, battery, signal strength, scrolling menu, and a boot splash
+- **Battery Monitoring**: LiPo voltage, percentage (discharge-curve based) and low/critical warnings
+- **Signal Quality Indicator**: 4-bar strength from RSSI threshold + packet delivery rate
+- **FreeRTOS Multitasking**: dedicated tasks for capture, transmit, receive, playback, and UI across both cores
 
 ## Hardware Requirements
 
@@ -132,10 +136,13 @@ This divider gives a 2:1 ratio, allowing measurement of up to ~6.6V with 3.3V AD
 
 Edit `include/config.h` to customize:
 
-- **Radio Settings**: Channel list, PA level, data rate
-- **Audio Settings**: Sample rate (8000 Hz default), ADPCM parameters
-- **Pin Assignments**: All GPIO pins can be remapped
-- **Default Values**: Volume, squelch, default channel
+- **Encryption**: `RADIO_ENCRYPTION` (on/off) and `RADIO_KEY` (256-bit pre-shared key — **change it**)
+- **Radio Settings**: Channel list, channel names, PA level, data rate, pipe address
+- **Audio Settings**: Sample rate (8000 Hz default), ADPCM packet sizing
+- **VOX**: `VOX_ENABLE_DEFAULT`, `VOX_OPEN_ENERGY`, `VOX_HANG_MS`
+- **TX Timeout**: `TOT_MS` (set `0` to disable)
+- **Pin Assignments**: All GPIO pins can be remapped (mind the strapping-pin note above)
+- **Default Values**: Volume (1–30), squelch (0–2000), default channel
 
 ## Usage
 
@@ -150,13 +157,18 @@ Edit `include/config.h` to customize:
 
 1. Press **SELECT** to enter the main menu
 2. Use **UP/DOWN** to navigate between options:
-   - **Volume**: Adjust speaker volume (1-16)
+   - **Volume**: Adjust speaker volume (1-30)
    - **Squelch**: Set signal threshold (0-2000)
    - **Channel**: Select radio channel (1-11)
+   - **Scan**: Sweep all channels and stop on the first active conversation (**BACK** to stop)
+   - **VOX**: Toggle hands-free voice-activated transmit on/off
    - **Back**: Exit menu
 3. Press **SELECT** to enter a submenu
-4. Use **UP/DOWN** to adjust values
+4. Use **UP/DOWN** to adjust values (hold to repeat)
 5. Press **BACK** to return to previous menu
+
+All settings (volume, squelch, channel, VOX) are saved to NVS automatically a few
+seconds after the last change and restored on the next power-up.
 
 ### Channel Frequencies
 
@@ -186,25 +198,61 @@ Edit `include/config.h` to customize:
 ### Radio Protocol
 
 - **Data Rate**: 2 Mbps
-- **Payload Size**: 32 bytes per packet
-- **CRC**: 16-bit
-- **Auto-Ack**: Enabled with retries
+- **Payload Size**: 32 bytes per packet (fixed)
+- **Link CRC**: 16-bit (nRF24 hardware)
+- **Auto-Ack**: Disabled — audio is broadcast one-to-many with no per-packet retries; lost packets are concealed at the receiver
+- **App CRC**: 8-bit over the (plaintext) audio payload, used for corruption / wrong-key detection
 
-### Packet Structure
+### Packet Structure (11-byte header + 21 data bytes)
 
 ```
-| Type (1B) | Seq (1B) | ADPCM Pred (2B) | ADPCM Idx (1B) | Len (1B) | Data (26B) |
+| Type (1B) | Seq (1B) | Nonce (4B) | ADPCM Pred (2B) | ADPCM Idx (1B) | Len (1B) | CRC (1B) | Data (21B) |
 ```
+
+- **Nonce**: per-packet monotonic counter (clear). Doubles as the ChaCha20 nonce, so every packet is independently decryptable — packet loss never desyncs the cipher. Persisted to NVS so reboots don't reuse keystream.
+- **Data**: 21 ADPCM bytes = 42 samples/packet. Encrypted in place when `RADIO_ENCRYPTION = 1`.
 
 ### FreeRTOS Tasks
 
 | Task | Priority | Core | Function |
 |------|----------|------|----------|
-| capture | 4 | 1 | Microphone capture & ADPCM encoding |
+| capture | 4 | 1 | Microphone capture, DSP, ADPCM encoding, VOX detection |
 | transmit | 5 | 1 | Radio transmission |
-| receive | 5 | 1 | Radio reception & decoding |
-| playback | 4 | 1 | I2S audio playback |
-| ui | 2 | 0 | Display, buttons, battery monitoring |
+| receive | 5 | 1 | Radio reception, decryption & decoding |
+| playback | 4 | 0 | I2S audio playback (RX audio + TX sidetone) |
+| ui | 2 | 0 | Display, buttons, battery, scan, settings persistence |
+
+## Security
+
+When `RADIO_ENCRYPTION` is `1` (default) in `include/config.h`, the audio payload of
+every packet is encrypted with a **ChaCha20** keystream keyed by a 256-bit pre-shared
+key (`RADIO_KEY`) and the per-packet nonce. This keeps the audio unintelligible to a
+casual listener with another nRF24 on the same channel and address.
+
+> **Change `RADIO_KEY` before shipping or relying on privacy.** The default key in the
+> repo is public and provides no security. Every unit that needs to talk to each other
+> must share the **same key** and the **same `RADIO_ENCRYPTION` setting**.
+
+Scope and limits (be honest with your users):
+
+- This is **confidentiality only**, not authenticated encryption. The 8-bit app CRC
+  gives ~1/256 wrong-key/tamper rejection, not a real MAC — a determined attacker could
+  still inject or replay packets.
+- The nonce space is 32-bit and persisted across reboots to avoid keystream reuse.
+- `adpcmPred`/`adpcmIdx` and headers are sent in clear (predictor state, not speech).
+
+Set `RADIO_ENCRYPTION` to `0` for an open (unencrypted) link that interoperates with
+plain builds.
+
+## Hardware notes
+
+- **Strapping pins**: `BTN_PTT` is on **GPIO0** and `BTN_SELECT` is on **GPIO2** — both
+  are ESP32 boot-strapping pins. Holding **PTT** (or SELECT) while powering on can put
+  the chip into download mode instead of booting. This cannot be fixed in firmware; if
+  you respin the PCB, move PTT/SELECT to non-strapping GPIOs (e.g. 16/17).
+- **NRF24L01 power**: the PA/LNA modules draw large current spikes. Use a solid 3.3 V
+  supply with a 10–100 µF cap across the module's VCC/GND, or you'll see brown-out
+  resets and corrupt packets. Lower `NRF_PA_LEVEL` if your rail is weak.
 
 ## Troubleshooting
 
@@ -216,7 +264,11 @@ Edit `include/config.h` to customize:
 ### Cannot Transmit/Receive
 - Verify NRF24L01 connections
 - Ensure both units are on same channel
+- Ensure both units have the **same `RADIO_KEY` and `RADIO_ENCRYPTION` setting** (a mismatch decodes as constant packet loss / silence)
 - Check power supply (NRF24L01 needs stable 3.3V)
+
+### Won't Boot / Stuck in Download Mode
+- Don't hold **PTT** (GPIO0) while powering on — it's a strapping pin (see [Hardware notes](#hardware-notes))
 
 ### Display Not Working
 - Verify I2C connections (SDA, SCL)
