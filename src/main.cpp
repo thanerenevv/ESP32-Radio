@@ -196,6 +196,12 @@ static uint8_t  gSignalBars  = 0;
 static std::atomic<int8_t> gRssiLast{-127};
 static uint32_t gSignalWindowStart = 0;
 
+// audio level meter (bottom-left, 4 bars). Audio tasks publish a peak amplitude;
+// task_ui applies a fast-attack/slow-decay envelope and maps it to 0..4 bars.
+static std::atomic<uint16_t> gAudioPeak{0};
+static uint16_t gAudioMeterEnv = 0;
+static uint8_t  gAudioBars     = 0;
+
 static uint8_t gTxSeq        = 0;
 static uint8_t gRxLastSeq    = 0xFF;
 static uint8_t gTxPktCounter = 0;
@@ -252,13 +258,13 @@ enum MenuState : uint8_t { MENU_NONE, MENU_MAIN, MENU_VOLUME, MENU_SQUELCH, MENU
 static MenuState gMenu    = MENU_NONE;
 static uint8_t   gMenuSel = 0;
 
-static const char * const MENU_ITEMS[] = {"Volume", "Squelch", "Channel", "Scan", "VOX", "Snd Test", "Back"};
-static constexpr uint8_t MENU_ITEM_COUNT    = 7;
-static constexpr uint8_t MENU_IDX_VOLUME    = 0;
-static constexpr uint8_t MENU_IDX_SQUELCH   = 1;
-static constexpr uint8_t MENU_IDX_CHANNEL   = 2;
-static constexpr uint8_t MENU_IDX_SCAN      = 3;
-static constexpr uint8_t MENU_IDX_VOX       = 4;
+static const char * const MENU_ITEMS[] = {"Channel", "Volume", "Squelch", "VOX", "Scan", "Snd Test"};
+static constexpr uint8_t MENU_ITEM_COUNT    = 6;
+static constexpr uint8_t MENU_IDX_CHANNEL   = 0;
+static constexpr uint8_t MENU_IDX_VOLUME    = 1;
+static constexpr uint8_t MENU_IDX_SQUELCH   = 2;
+static constexpr uint8_t MENU_IDX_VOX       = 3;
+static constexpr uint8_t MENU_IDX_SCAN      = 4;
 static constexpr uint8_t MENU_IDX_SOUNDTEST = 5;
 static constexpr uint8_t MENU_IDX_BACK      = 6;
 
@@ -413,6 +419,20 @@ static uint32_t pcm_energy(const int16_t *buf, uint16_t len) {
     return (uint32_t)(acc / len);
 }
 
+// Publish the peak |sample| of a buffer for the on-screen audio meter. Cheap max
+// against the current pending peak; task_ui consumes and clears it. TX and RX are
+// half-duplex so only one producer is active at a time.
+static void publish_audio_peak(const int16_t *buf, uint16_t len) {
+    int32_t peak = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        int32_t a = buf[i] < 0 ? -buf[i] : buf[i];
+        if (a > peak) peak = a;
+    }
+    uint16_t p = (uint16_t)peak;
+    if (p > gAudioPeak.load(std::memory_order_relaxed))
+        gAudioPeak.store(p, std::memory_order_relaxed);
+}
+
 static void remove_dc_offset(int16_t *buf, uint16_t len) {
     if (len == 0) return;
     int32_t sum = 0;
@@ -481,6 +501,16 @@ static void apply_limiter(int16_t *buf, uint16_t len) {
     }
 }
 
+// Saturating left-shift: boosts quiet mic signals before the AGC/DSP chain.
+// Clamps to [-32768, 32767] so loud inputs don't wrap — the limiter downstream
+// then smooths any peaks that still hit the ceiling.
+static void apply_pregain(int16_t *buf, uint16_t len, uint8_t shift) {
+    for (uint16_t i = 0; i < len; i++) {
+        int32_t s = (int32_t)buf[i] << shift;
+        buf[i] = (int16_t)((s > 32767) ? 32767 : (s < -32768) ? -32768 : s);
+    }
+}
+
 static void apply_fade_in(int16_t *buf, uint16_t len, uint16_t fadeLen) {
     uint16_t n = (len < fadeLen) ? len : fadeLen;
     for (uint16_t i = 0; i < n; i++)
@@ -501,9 +531,9 @@ static void apply_agc(int16_t *buf, uint16_t len) {
         else                    gAgcEnvelope += (abs - gAgcEnvelope) >> 8;
     }
     int32_t targetGain = (gAgcEnvelope > 0) ? (24000L * 256) / gAgcEnvelope : 256;
-    if (targetGain > 1024) targetGain = 1024;
+    if (targetGain > 4096) targetGain = 4096;   // 16x ceiling (was 4x) for INMP441
     if (targetGain < 64)   targetGain = 64;
-    if (targetGain > gAgcGain) gAgcGain += (targetGain - gAgcGain) >> 9;   // slow attack
+    if (targetGain > gAgcGain) gAgcGain += (targetGain - gAgcGain) >> 6;   // attack (was >>9)
     else                       gAgcGain += (targetGain - gAgcGain) >> 4;   // fast release
 
     for (uint16_t i = 0; i < len; i++) {
@@ -549,6 +579,30 @@ static void apply_noise_gate(int16_t *buf, uint16_t len, uint16_t openThresh, ui
 }
 
 // ---- Signal quality -------------------------------------------------------
+
+// Called every task_ui tick (~10 ms). Instant attack to the latest peak, gradual
+// decay so the meter falls smoothly back to empty when audio stops.
+static void update_audio_meter() {
+    uint16_t peak = gAudioPeak.exchange(0, std::memory_order_relaxed);
+    if (peak > gAudioMeterEnv) {
+        gAudioMeterEnv = peak;
+    } else if (gAudioMeterEnv > 0) {
+        uint16_t d = (uint16_t)((gAudioMeterEnv >> 3) + 16);   // ~12.5%/tick + floor
+        gAudioMeterEnv = (d >= gAudioMeterEnv) ? 0 : (uint16_t)(gAudioMeterEnv - d);
+    }
+
+    uint8_t bars;
+    if      (gAudioMeterEnv > 18000) bars = 4;
+    else if (gAudioMeterEnv >  9000) bars = 3;
+    else if (gAudioMeterEnv >  3500) bars = 2;
+    else if (gAudioMeterEnv >  1200) bars = 1;
+    else                             bars = 0;
+
+    if (bars != gAudioBars) {
+        gAudioBars = bars;
+        if (gMenu == MENU_NONE) gDisplayDirty = true;   // only the main screen shows it
+    }
+}
 
 static void update_signal_bars() {
     uint32_t now     = millis();
@@ -621,6 +675,18 @@ static void draw_signal_bars(uint8_t x, uint8_t y, uint8_t bars) {
     }
 }
 
+// Small audio level meter: 4 ascending bars filled up to `bars`. baseY is the
+// bottom (exclusive) row, so bars grow upward from there.
+static void draw_meter_bars(uint8_t x, uint8_t baseY, uint8_t bars) {
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t h  = (uint8_t)((i + 1) * 3);
+        uint8_t bx = x + i * 5;
+        uint8_t by = baseY - h;
+        if (i < bars) display.fillRect(bx, by, 4, h, SSD1306_WHITE);
+        else          display.drawRect(bx, by, 4, h, SSD1306_WHITE);
+    }
+}
+
 static void draw_splash_screen() {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -639,83 +705,114 @@ static void draw_splash_screen() {
 static void draw_main_screen() {
     uint8_t ch = (uint8_t)gChannelIdx;
     display.clearDisplay();
-    display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.print("CH");
-    display.print(ch + 1);
-    display.print(" ");
-    display.print(CHANNEL_NAMES[ch]);
-    if (gVoxEnable.load()) {
-        display.setCursor(98, 0);
-        display.print("V");
-    }
-    draw_signal_bars(108, 0, gSignalBars);
+    display.setTextSize(1);
 
-    display.setCursor(0, 12);
-    display.print("BAT:");
-    display.print(gBatVoltage, 2);
-    display.print("V ");
+    // Top left: battery icon + percentage
+    draw_battery_icon(0, 0, gBatPct);
+    display.setCursor(22, 0);
+    if (gBatWarning) display.print("!");
     display.print(gBatPct);
     display.print("%");
-    draw_battery_icon(95, 12, gBatPct);
 
-    display.setCursor(0, 24);
-    if (gBatWarning) {
-        display.print(gBatCritical ? "!! LOW BAT !!" : "! Low battery");
-    } else {
-        display.print("SQ:");
-        display.print((uint16_t)gSquelch);
-        display.print("  VOL:");
-        display.print((uint8_t)gVolume);
+    // VOX enable indicator
+    if (gVoxEnable.load()) {
+        display.setCursor(70, 0);
+        display.print("V");
     }
 
-    display.drawFastHLine(0, 35, 128, SSD1306_WHITE);
-    display.setTextSize(2);
-    display.setCursor(0, 40);
-    if (gTotLatched.load())          display.print("TIMEOUT");
-    else if (gTransmitting.load())   display.print("TX >>>");
-    else                             display.print("RX ...");
+    // Top right: signal bars
+    draw_signal_bars(108, 0, gSignalBars);
 
-    if (!gTransmitting.load() && !gTotLatched.load()) {
-        display.setTextSize(1);
-        display.setCursor(92, 55);
-        display.print("JB:");
-        display.print((uint8_t)gJbTarget);
-    }
+    // Center: channel number (large)
+    char chBuf[8];
+    snprintf(chBuf, sizeof(chBuf), "CH %d", ch + 1);
+    uint8_t chLen = (uint8_t)strlen(chBuf);
+    display.setTextSize(3);
+    display.setCursor((128 - chLen * 18) / 2, 16);
+    display.print(chBuf);
+
+    // Below center: frequency
+    char freqBuf[12];
+    snprintf(freqBuf, sizeof(freqBuf), "%u MHz", CHANNEL_MHZ[ch]);
+    uint8_t freqLen = (uint8_t)strlen(freqBuf);
+    display.setTextSize(1);
+    display.setCursor((128 - freqLen * 6) / 2, 44);
+    display.print(freqBuf);
+
+    // Bottom left: audio level meter
+    draw_meter_bars(2, 64, gAudioBars);
+
+    // Bottom right: status
+    const char *status;
+    if (gTotLatched.load())        status = "TIMEOUT";
+    else if (gTransmitting.load()) status = "TX >>>";
+    else                           status = "RX ...";
+    display.setCursor(128 - (uint8_t)strlen(status) * 6, 56);
+    display.print(status);
+
     display.display();
+}
+
+// Returns the current value string for a menu item (empty string = no value).
+static void menu_item_value(uint8_t idx, char *buf, uint8_t bufLen) {
+    switch (idx) {
+        case MENU_IDX_CHANNEL:
+            snprintf(buf, bufLen, "CH%d", (uint8_t)gChannelIdx + 1);
+            break;
+        case MENU_IDX_VOLUME:
+            snprintf(buf, bufLen, "%d", (uint8_t)gVolume);
+            break;
+        case MENU_IDX_SQUELCH:
+            snprintf(buf, bufLen, "%d", (uint16_t)gSquelch);
+            break;
+        case MENU_IDX_VOX:
+            snprintf(buf, bufLen, "%s", gVoxEnable.load() ? "ON" : "OFF");
+            break;
+        default:
+            buf[0] = '\0';
+            break;
+    }
 }
 
 static void draw_menu_screen() {
     display.clearDisplay();
     display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(28, 0);
-    display.print("[ SETTINGS ]");
-    display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 
-    const uint8_t VIS  = 5;
-    const uint8_t rowH = 11;
+    // Header
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 1);
+    display.print("SETTINGS");
+    display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+    const uint8_t VIS = 5;
+    const uint8_t ROW = 10;    // px per row
+    const uint8_t TOP = 11;    // y of first row
     uint8_t first = (gMenuSel >= VIS) ? (gMenuSel - VIS + 1) : 0;
 
     for (uint8_t r = 0; r < VIS && (first + r) < MENU_ITEM_COUNT; r++) {
-        uint8_t i = first + r;
-        uint8_t y = 11 + r * rowH;
-        char buf[20];
-        if (i == MENU_IDX_VOX)
-            snprintf(buf, sizeof(buf), "VOX: %s", gVoxEnable.load() ? "On" : "Off");
-        else {
-            strncpy(buf, MENU_ITEMS[i], sizeof(buf));
-            buf[sizeof(buf) - 1] = '\0';
-        }
-        if (i == gMenuSel) {
-            display.fillRect(0, y, 128, rowH, SSD1306_WHITE);
+        uint8_t i   = first + r;
+        uint8_t y   = TOP + r * ROW;
+        bool    sel = (i == gMenuSel);
+
+        if (sel) {
+            display.fillRect(0, y, 128, ROW, SSD1306_WHITE);
             display.setTextColor(SSD1306_BLACK);
         } else {
             display.setTextColor(SSD1306_WHITE);
         }
-        display.setCursor(6, y + 2);
-        display.print(buf);
+
+        // Label
+        display.setCursor(6, y + 1);
+        display.print(MENU_ITEMS[i]);
+
+        // Current value, right-aligned
+        char val[8];
+        menu_item_value(i, val, sizeof(val));
+        if (val[0]) {
+            display.setCursor(128 - (uint8_t)(strlen(val) * 6) - 4, y + 1);
+            display.print(val);
+        }
     }
     display.display();
 }
@@ -1009,6 +1106,9 @@ static void handle_menu_buttons() {
 
     if (upAct) {
         switch (gMenu) {
+            case MENU_NONE:
+                change_channel(+1);
+                break;
             case MENU_MAIN:
                 if (gMenuSel > 0) { gMenuSel--; gDisplayDirty = true; }
                 break;
@@ -1035,6 +1135,9 @@ static void handle_menu_buttons() {
 
     if (downAct) {
         switch (gMenu) {
+            case MENU_NONE:
+                change_channel(-1);
+                break;
             case MENU_MAIN:
                 if (gMenuSel < MENU_ITEM_COUNT - 1) { gMenuSel++; gDisplayDirty = true; }
                 break;
@@ -1058,13 +1161,18 @@ static void handle_menu_buttons() {
         btn_clear_hold(1);
     }
 
-    if (backFell && gMenu != MENU_NONE) {
-        if (gMenu == MENU_SOUNDTEST) gSoundTestActive.store(false);
-        if (gMenu == MENU_MAIN) {
-            gMenu    = MENU_NONE;
-            gMenuSel = 0;          // reset cursor only when closing the whole menu
+    if (backFell) {
+        if (gMenu == MENU_NONE) {
+            gMenu    = MENU_MAIN;   // BACK on home screen = open settings
+            gMenuSel = 0;
         } else {
-            gMenu = MENU_MAIN;     // back to list, cursor stays on the item they came from
+            if (gMenu == MENU_SOUNDTEST) gSoundTestActive.store(false);
+            if (gMenu == MENU_MAIN) {
+                gMenu    = MENU_NONE;
+                gMenuSel = 0;       // reset cursor only when closing the whole menu
+            } else {
+                gMenu = MENU_MAIN;  // back to list, cursor stays on the item they came from
+            }
         }
         gDisplayDirty = true;
     }
@@ -1075,10 +1183,9 @@ static void handle_menu_buttons() {
             gMenuSel = 0;
         } else if (gMenu == MENU_MAIN) {
             switch (gMenuSel) {
-                case MENU_IDX_VOLUME:  gMenu = MENU_VOLUME;  break;
-                case MENU_IDX_SQUELCH: gMenu = MENU_SQUELCH; break;
-                case MENU_IDX_CHANNEL: gMenu = MENU_CHANNEL; break;
-                case MENU_IDX_SCAN:    start_scan();         break;
+                case MENU_IDX_CHANNEL:  gMenu = MENU_CHANNEL;  break;
+                case MENU_IDX_VOLUME:   gMenu = MENU_VOLUME;   break;
+                case MENU_IDX_SQUELCH:  gMenu = MENU_SQUELCH;  break;
                 case MENU_IDX_VOX: {
                     bool en = !gVoxEnable.load();
                     gVoxEnable.store(en);
@@ -1086,13 +1193,13 @@ static void handle_menu_buttons() {
                     settings_mark_dirty();
                     break;
                 }
+                case MENU_IDX_SCAN:    start_scan(); break;
                 case MENU_IDX_SOUNDTEST:
                     if (!gTransmitting.load()) {
                         gMenu = MENU_SOUNDTEST;
                         gSoundTestActive.store(true);
                     }
                     break;
-                case MENU_IDX_BACK:    gMenu = MENU_NONE;    break;
             }
         }
         gDisplayDirty = true;
@@ -1178,6 +1285,7 @@ static void task_capture(void *) {
 
         if (!gTransmitting.load()) continue;   // monitoring only, not actually transmitting
 
+        apply_pregain(pcmBuf, samples, MIC_PREGAIN_SHIFT);
         apply_preemphasis(pcmBuf, samples);
         apply_speech_eq(pcmBuf, samples);
         apply_lowpass(pcmBuf, samples);
@@ -1189,6 +1297,8 @@ static void task_capture(void *) {
             apply_fade_in(pcmBuf, samples, 32);
             gTxFirstFrame = false;
         }
+
+        publish_audio_peak(pcmBuf, samples);   // TX: mic level for the on-screen meter
 
         // sidetone: attenuated copy of mic so the operator hears themselves
         RxFrame sf = {};
@@ -1393,6 +1503,8 @@ static void task_playback(void *) {
         if (frame.gap && !frame.concealed) apply_fade_in(frame.pcm, frame.count, 16);
         if (frame.concealed)               apply_fade_out(frame.pcm, frame.count, 8);
 
+        publish_audio_peak(frame.pcm, frame.count);   // RX: received audio level for the meter
+
         uint8_t logVol = LOG_VOL_TABLE[(uint8_t)gVolume - VOLUME_MIN];
         if (logVol != 128) {   // 128 = unity for >> 7 scaling
             for (uint16_t i = 0; i < frame.count; i++) {
@@ -1431,14 +1543,20 @@ static void task_ui(void *) {
         }
 
         // ---- TX timeout (anti-stuck-PTT / channel hog) ----
-        if (TOT_MS > 0 && gTransmitting.load() && !gTotLatched.load() &&
-            (now - gTxStartMs.load()) >= TOT_MS) {
-            gTotLatched.store(true);
-            Serial.printf("[TOT] timeout after %lu ms TX (ptt=%d vox=%d)\n",
-                          (unsigned long)(now - gTxStartMs.load()),
-                          gPttHeld.load(), gVoxActive.load());
-            request_tx_state();           // forces RX
-            gDisplayDirty = true;
+        // Re-read millis() here instead of reusing `now` from the top of the loop:
+        // gTxStartMs is stored later in this same iteration (inside request_tx_state())
+        // so `now - gTxStartMs` can underflow (gTxStartMs > now) and wrap to a huge
+        // value, latching TOT instantly on the first PTT press.
+        if (TOT_MS > 0 && gTransmitting.load() && !gTotLatched.load()) {
+            uint32_t txElapsed = millis() - gTxStartMs.load();
+            if (txElapsed >= TOT_MS) {
+                gTotLatched.store(true);
+                Serial.printf("[TOT] timeout after %lu ms TX (ptt=%d vox=%d)\n",
+                              (unsigned long)txElapsed,
+                              gPttHeld.load(), gVoxActive.load());
+                request_tx_state();           // forces RX
+                gDisplayDirty = true;
+            }
         }
         if (gTotLatched.load() && !gPttHeld.load() && !gVoxActive.load())
             gTotLatched.store(false);
@@ -1448,6 +1566,7 @@ static void task_ui(void *) {
 
         update_signal_bars();
         update_jitter_buffer();
+        update_audio_meter();
 
         if (now - lastBat >= BAT_READ_MS) {
             lastBat     = now;

@@ -65,6 +65,14 @@ static const char * const CHANNEL_NAMES[] = {
 #define NRF_DATA_RATE       RF24_2MBPS
 #define NRF_PIPE_ADDR       0xE8E8F0F0E1LL
 
+// ---- Microphone gain -------------------------------------------------------
+// The INMP441 outputs low amplitudes (~100-300 for normal speech at arm's
+// length). This left-shift is applied before the DSP chain and AGC so the AGC
+// operates on a well-conditioned signal. Each step doubles the level:
+//   0 = no boost  1 = 2x  2 = 4x  3 = 8x  4 = 16x
+// Start at 3 (8x). If the mic still clips your loud voice, reduce to 2.
+#define MIC_PREGAIN_SHIFT   3
+
 // ---- Audio / codec ---------------------------------------------------------
 // Packet wire layout (see Packet struct in main.cpp), 11-byte header:
 //   type(1) seq(1) nonce(4) adpcmPred(2) adpcmIdx(1) dataLen(1) appCrc(1)
